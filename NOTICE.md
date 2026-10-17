@@ -16,7 +16,7 @@
 | [Caelestia-shell](https://github.com/MipLinux/Caelestia-shell) | 本仓库：顶栏、面板、启动器等 shell 本体 | fork |
 | [Caelestia-cli](https://github.com/MipLinux/Caelestia-cli) | `caelestia` 安装 / 更新命令 | fork |
 
-三个 fork 的 `main` 跟踪上游；MipLinux 改动放 `mip` 分支 / tag，发布时记录上游 base commit。
+三个 fork 的 `main` 跟踪上游，只保留最小的 MipLinux 文档 / 许可声明；功能改动放 `mip` 分支 / tag，发布时记录上游 base commit。
 dots / shell / cli 与 Quickshell 的 pin 一起对齐，不单独升级其中一个。
 
 ## 相关组件
