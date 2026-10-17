@@ -32,7 +32,7 @@ NVIDIA 用户态组件（`nvidia-utils`）是独立专有组件，不属于本�
 
 ## 修改与再分发
 
-- 修改本仓库的文件时，保留原版权声明，并标明 MipLinux 的改动。
+- 修改本仓库的文件时，保留原版权声明，并在改动处标明 MipLinux 的改动与日期。
 - 再分发本仓库或其修改版时，按 GPL-3.0-only 提供对应源码与许可全文。
 - `Caelestia` 名称与标识的权利不随 GPL 授予；对外产品名使用 MipLinux，并保留
   “based on Caelestia” 的来源说明。
