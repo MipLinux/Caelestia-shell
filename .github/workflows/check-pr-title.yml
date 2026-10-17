@@ -53,6 +53,10 @@ jobs:
             i18n
             nix
             scripts
+            docs
+            ci
+            workflow
+            release
           subjectPattern: ^(?![A-Z]).+$ # No starting with uppercase
           subjectPatternError: The subject must not start with an uppercase character.
 

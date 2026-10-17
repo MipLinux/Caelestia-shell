@@ -20,3 +20,16 @@ There are only a few rules:
 - PR descriptions should be descriptive
     - Please explain what the PR does and how to use it in your PR description
     - Also include any breaking changes and/or side effects of the PR
+
+## Workflow
+
+- Work is tracked as GitHub issues with the `task` label; the assignee is the owner.
+  The issue body must name the files you will touch, and acceptance must be a command
+  plus its expected result. See [docs/work/README.md](../docs/work/README.md).
+- Draft a task issue with [docs/work/TEMPLATE.md](../docs/work/TEMPLATE.md), then run
+  `./scripts/workflow/check-work-issue.sh` before publishing it.
+- Fill in [the PR template](pull_request_template.md), including `Closes #N`.
+  A PR that closes an issue will get an acceptance reconciliation comment.
+- Maintainers can request the strict review with `/mipl-review` (or `/caelestia-review`)
+  on a PR. The review only describes problems; it is not a merge gate.
+- Read [AGENTS.md](../AGENTS.md) before using an AI agent in this repository.

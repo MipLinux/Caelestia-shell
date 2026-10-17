@@ -1,0 +1,259 @@
+name: PR review（严格型代码审查）
+
+# 判据唯一源：docs/work/ai-code-review-rubric.md
+# 上下文脚本：scripts/workflow/pr-review-context.sh
+# 结果整形：scripts/workflow/render-pr-review.py
+#
+# 两条执行路径：
+#   1. 配置 vars.REVIEWER_ENDPOINT：用 GitHub OIDC 调自建 agent，agent 可只读克隆全仓核对。
+#   2. 只配置 secrets.DEEPSEEK_API_KEY：直接调 DeepSeek API，只审查本次 diff。
+# 两者都没有时跳过，并在 run 页面写明原因。
+#
+# 触发：维护者在 PR 评论 `/mipl-review` 或 `/caelestia-review`，或手动 dispatch。
+# 不会自动在每个 PR 上跑 —— 严格审查按需唤醒，避免噪音和 token 消耗。
+
+on:
+  issue_comment:
+    types: [created]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: 'PR 编号'
+        required: true
+        type: string
+
+permissions:
+  pull-requests: write
+  contents: read
+  # 换取服务端可验签的 OIDC token；服务端只认本仓库 + 固定 audience。
+  id-token: write
+
+concurrency:
+  group: pr-review-${{ github.event.issue.number || github.event.inputs.pr }}
+  cancel-in-progress: false
+
+jobs:
+  review:
+    # 严格门禁：
+    # 1. 仅限针对 PR 的评论（issue.pull_request 存在）或手动 dispatch；
+    # 2. 评论必须包含触发指令；
+    # 3. 仅项目核心维护者（OWNER / MEMBER）能触发。
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.issue.pull_request != null &&
+       (contains(github.event.comment.body, '/mipl-review') ||
+        contains(github.event.comment.body, '/caelestia-review')) &&
+       contains(fromJSON('["OWNER","MEMBER"]'), github.event.comment.author_association))
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Check trigger and configuration
+        id: precheck
+        env:
+          INPUT_PR: ${{ github.event.issue.number || github.event.inputs.pr }}
+          ENDPOINT: ${{ vars.REVIEWER_ENDPOINT }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          REVIEWER_APP_ID: ${{ secrets.REVIEWER_APP_ID }}
+          REVIEWER_PRIVATE_KEY: ${{ secrets.REVIEWER_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          case "$INPUT_PR" in
+            ''|*[!0-9]*) echo "::error::PR 编号必须是纯数字"; exit 1 ;;
+          esac
+          echo "pr=$INPUT_PR" >>"$GITHUB_OUTPUT"
+
+          if [ -n "$ENDPOINT" ]; then
+            mode=agent
+          elif [ -n "$DEEPSEEK_API_KEY" ]; then
+            mode=api
+          else
+            mode=skip
+          fi
+          echo "mode=$mode" >>"$GITHUB_OUTPUT"
+
+          if [ -n "$REVIEWER_APP_ID" ] && [ -n "$REVIEWER_PRIVATE_KEY" ]; then
+            echo "use_app=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "use_app=false" >>"$GITHUB_OUTPUT"
+          fi
+
+          if [ "$mode" = "skip" ]; then
+            {
+              echo "### PR review 已跳过"
+              echo
+              echo "未配置 \`vars.REVIEWER_ENDPOINT\` 或 \`secrets.DEEPSEEK_API_KEY\`。"
+              echo
+              echo "- 自建 agent：配置仓库变量 \`REVIEWER_ENDPOINT\`。"
+              echo "- 直连 API：配置仓库 secret \`DEEPSEEK_API_KEY\`。"
+            } >>"$GITHUB_STEP_SUMMARY"
+            echo "::notice::未配置审查后端，跳过 PR review。"
+          fi
+
+      - name: Get reviewer App token
+        id: app-token
+        if: steps.precheck.outputs.mode == 'agent' && steps.precheck.outputs.use_app == 'true'
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.REVIEWER_APP_ID }}
+          private-key: ${{ secrets.REVIEWER_PRIVATE_KEY }}
+
+      - name: Acknowledge review start
+        id: ack
+        if: steps.precheck.outputs.mode != 'skip'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
+          PR: ${{ steps.precheck.outputs.pr }}
+          ACTOR: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          HEAD_SHA=$(gh api "repos/{owner}/{repo}/pulls/$PR" --jq .head.sha)
+          short="${HEAD_SHA:0:7}"
+          body=$(printf '%s\n' \
+            "## 🔍 严格型审查中…" \
+            "" \
+            "\`${short}\` · @${ACTOR} 触发" \
+            "" \
+            "<!-- caelestia-pr-review-ack: run=${GITHUB_RUN_ID} -->")
+          comment_id=$(jq -n --arg body "$body" '{body: $body}' \
+            | gh api -X POST "repos/{owner}/{repo}/issues/$PR/comments" --input - --jq .id)
+          echo "comment_id=$comment_id" >>"$GITHUB_OUTPUT"
+          echo "已投递回执评论 #$comment_id"
+
+      - name: Generate review context
+        if: steps.precheck.outputs.mode != 'skip'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
+          PR: ${{ steps.precheck.outputs.pr }}
+        run: |
+          set -euo pipefail
+          ./scripts/workflow/pr-review-context.sh --pr "$PR" --out "$GITHUB_WORKSPACE/.pr-review"
+
+      - name: Strict review (self-hosted agent, GitHub OIDC)
+        id: agent
+        if: steps.precheck.outputs.mode == 'agent'
+        env:
+          ENDPOINT: ${{ vars.REVIEWER_ENDPOINT }}
+          AUDIENCE: ${{ vars.REVIEWER_AUDIENCE || 'mipl-reviewer' }}
+          PR: ${{ steps.precheck.outputs.pr }}
+        run: |
+          set -euo pipefail
+          oidc=$(curl -sS --fail-with-body --max-time 30 \
+                   -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+                   "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=${AUDIENCE}" | jq -r '.value // empty')
+          [ -n "$oidc" ] || { echo "::error::取 OIDC token 失败"; exit 1; }
+
+          HEAD_SHA=$(awk -F'\t' '$1=="head"{print $2}' .pr-review/meta.tsv)
+          [ -n "$HEAD_SHA" ] || { echo "::error::未能解析到 head sha"; exit 1; }
+
+          jq -n --rawfile rubric docs/work/ai-code-review-rubric.md \
+                --rawfile context .pr-review/context.md \
+                --argjson pr "$PR" --arg sha "$HEAD_SHA" \
+                '{rubric:$rubric, context:$context, pr:$pr, head_sha:$sha}' \
+            >.pr-review/request.json
+          echo "请求体 $(wc -c <.pr-review/request.json) 字节 -> $ENDPOINT"
+
+          curl -sS --fail-with-body --max-time 900 \
+            -H "Authorization: Bearer $oidc" \
+            -H 'Content-Type: application/json' \
+            --data-binary @.pr-review/request.json \
+            "$ENDPOINT" -o .pr-review/response.txt
+          [ -s .pr-review/response.txt ] || { echo "::error::服务端返回为空"; exit 1; }
+          echo "已收到审查结果 $(wc -c <.pr-review/response.txt) 字节"
+
+      - name: Strict review (DeepSeek API)
+        id: api
+        if: steps.precheck.outputs.mode == 'api'
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          PR: ${{ steps.precheck.outputs.pr }}
+        run: |
+          set -euo pipefail
+          HEAD_SHA=$(awk -F'\t' '$1=="head"{print $2}' .pr-review/meta.tsv)
+          [ -n "$HEAD_SHA" ] || { echo "::error::未能解析到 head sha"; exit 1; }
+
+          jq -n --rawfile rubric docs/work/ai-code-review-rubric.md \
+                --rawfile context .pr-review/context.md \
+                '{model:"deepseek-flash", max_tokens:65536, messages:[
+                   {role:"system", content:$rubric},
+                   {role:"user", content:$context}
+                 ]}' >.pr-review/request.json
+
+          curl -sS --fail-with-body --max-time 900 \
+            -H "Authorization: Bearer $DEEPSEEK_API_KEY" \
+            -H 'Content-Type: application/json' \
+            --data-binary @.pr-review/request.json \
+            https://api.deepseek.com/chat/completions -o .pr-review/response.json
+
+          jq -r '.choices[0].message.content // empty' .pr-review/response.json >.pr-review/response.txt
+          [ -s .pr-review/response.txt ] || { echo "::error::DeepSeek 返回为空"; exit 1; }
+          echo "已收到审查结果 $(wc -c <.pr-review/response.txt) 字节"
+
+      - name: Publish review
+        if: steps.precheck.outputs.mode != 'skip'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
+          PR: ${{ steps.precheck.outputs.pr }}
+          ACK_COMMENT_ID: ${{ steps.ack.outputs.comment_id }}
+        run: |
+          set -euo pipefail
+
+          HEAD_SHA=$(awk -F'\t' '$1=="head"{print $2}' .pr-review/meta.tsv)
+          [ -n "$HEAD_SHA" ] || { echo "::error::未能解析到 head sha"; exit 1; }
+
+          python3 scripts/workflow/render-pr-review.py \
+            --response .pr-review/response.txt \
+            --context .pr-review/context.md \
+            --head "$HEAD_SHA" \
+            --output .pr-review/payload.json
+
+          gh api -X POST "repos/{owner}/{repo}/pulls/$PR/reviews" \
+            --input .pr-review/payload.json >/dev/null
+          echo "Review 已回传至 PR #$PR"
+
+          if [ -n "${ACK_COMMENT_ID:-}" ]; then
+            verdict=$(jq -r '.body' .pr-review/payload.json \
+              | sed -n 's/.*\*\*结论\*\*: \([A-Z_]*\).*/\1/p' | head -1)
+            case "$verdict" in
+              PASS) emoji="✅" ;;
+              NEEDS_ATTENTION) emoji="⚠️" ;;
+              *) verdict="UNKNOWN"; emoji="❓" ;;
+            esac
+            done_body=$(printf '%s\n' \
+              "${emoji} **审查完成** · 结论 \`${verdict}\` · \`$(echo "$HEAD_SHA" | cut -c1-7)\`" \
+              "" \
+              "<!-- caelestia-pr-review-ack: done run=${GITHUB_RUN_ID} -->")
+            if jq -n --arg body "$done_body" '{body: $body}' \
+              | gh api -X PATCH "repos/{owner}/{repo}/issues/comments/$ACK_COMMENT_ID" --input - >/dev/null; then
+              echo "回执评论 #$ACK_COMMENT_ID 已更新为完成态"
+            else
+              echo "::warning::回执评论 #$ACK_COMMENT_ID 更新失败（Review 已回传，不影响结论）"
+            fi
+          fi
+
+          {
+            echo "### Caelestia PR 严格型审查结果"
+            echo
+            jq -r '.body' .pr-review/payload.json
+            echo
+            echo "- **行级批注数**: $(jq ".comments | length" .pr-review/payload.json)"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Mark acknowledgement as failed
+        if: failure() && steps.precheck.outputs.mode != 'skip' && steps.ack.outputs.comment_id != ''
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.GITHUB_TOKEN }}
+          ACK_COMMENT_ID: ${{ steps.ack.outputs.comment_id }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          body=$(printf '%s\n' \
+            "⚠️ **审查中断**：工作流在回传结论前失败，请查看 [运行日志](${RUN_URL})。" \
+            "" \
+            "<!-- caelestia-pr-review-ack: failed run=${GITHUB_RUN_ID} -->")
+          jq -n --arg body "$body" '{body: $body}' \
+            | gh api -X PATCH "repos/{owner}/{repo}/issues/comments/$ACK_COMMENT_ID" --input - >/dev/null
+          echo "回执评论 #$ACK_COMMENT_ID 已标注为中断"

@@ -66,6 +66,8 @@ jobs:
               - "!**/*.md"
               - "!.github/**"
               - "!scripts/qml-lint-conventions.py"
+              - "!scripts/workflow/**"
+              - "!.coderabbit.yaml"
               - "!.vscode/**"
               - "!assets/**"
               - "!.gitignore"

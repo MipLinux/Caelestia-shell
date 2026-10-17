@@ -1,0 +1,5 @@
+# 默认代码所有者：任何文件的改动都需要 @LaT-SKY 审核。
+#
+# 语法：每行 = 路径模式 + 一个或多个 owner。后面的规则覆盖前面的，最后匹配的那条生效。
+# 要让这条生效，仓库 ruleset 需要开启「Require review from Code Owners」。
+*       @LaT-SKY
