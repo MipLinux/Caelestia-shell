@@ -1,0 +1,81 @@
+name: 工作分配
+description: 一条有明确目标、实现范围、验收判据与回报要求的工作
+title: "[工作] "
+labels: ["task"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        一条工作 = 一个 issue。**验收写不出来就别开** —— 写不出判据，说明这件事还没想清楚。
+
+        字段规范见 [docs/work/README.md](https://github.com/MipLinux/Caelestia-shell/blob/main/docs/work/README.md)；
+        正文骨架见 [TEMPLATE.md](https://github.com/MipLinux/Caelestia-shell/blob/main/docs/work/TEMPLATE.md)。
+
+        创建 issue 后用 GitHub 的 **Assignees** 控件选择受理人；正文不记录受理人。
+
+  - type: input
+    id: goal
+    attributes:
+      label: 目标
+      description: 一句话，写「什么从不能变成能 / 从错变成对」，不写做法。
+      placeholder: 例如：多显示器下 bar 不再把窗口挤到屏幕外。
+    validations:
+      required: true
+
+  - type: textarea
+    id: implement
+    attributes:
+      label: 实现
+      description: |
+        做什么、**改哪些文件（逐个写路径）**、明确**不**做什么。
+        路径写出来，所有权才切得开 —— 撞在同一批文件上的两条工作没法并行。
+      placeholder: |
+        改 modules/bar/Bar.qml 的布局计算；
+        不碰 modules/bar/Popup.qml（那是另一条工作）。
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: 验收
+      description: |
+        能在本机跑出来的判据：**命令 + 期望结果**。
+        没有实测证据不许写「已验证」，只能写 未实测 / 仅静态检查 / 仅 dry-run。
+      placeholder: |
+        `./scripts/qml-lint-conventions.py` → 退出码 0；
+        `cmake --build build` → 退出码 0，且多显示器下 bar 不越界。
+    validations:
+      required: true
+
+  - type: textarea
+    id: report
+    attributes:
+      label: 回报
+      description: 做完交什么、给谁 —— 命令输出、文件路径、实测截图、PR 链接，写清楚。
+      placeholder: 例如：把构建与实测输出贴在 issue 下，并 @ 维护者过目。
+    validations:
+      required: true
+
+  - type: textarea
+    id: depends-on
+    attributes:
+      label: 依赖
+      description: 被哪个 issue / 分支 / 里程碑卡住；没有就写「无」。
+      placeholder: 无
+    validations:
+      required: true
+
+  - type: markdown
+    attributes:
+      value: |
+        ---
+
+        **开工前请执行：**
+
+        ```bash
+        git switch main && git pull --ff-only origin main
+        git switch -c feat/<主题>   # 只改文档用 docs/<主题>
+        ```
+
+        > 分支不在 `main` 上、或拉取不是快进 → 停下来问维护者，**不要**自行 `merge` / `rebase` / `reset --hard`。

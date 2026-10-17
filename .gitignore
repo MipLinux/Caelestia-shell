@@ -4,3 +4,10 @@
 build/
 .cache/
 logs
+
+# Workflow drafts and generated review context
+out/
+.ai-review/
+.pr-acceptance/
+.pr-review/
+__pycache__/

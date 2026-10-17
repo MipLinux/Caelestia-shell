@@ -1,0 +1,171 @@
+name: PR acceptance（验收对账）
+
+# 判据唯一源：docs/work/ai-review-rubric.md C 节
+# 上下文脚本：scripts/workflow/pr-acceptance-context.sh
+#
+# 把 PR 正文的「验证方式」与它 Closes 的 issue 的「验收」对成分档表。
+# 本检查不判定真伪，不出「通过 / 不通过」，也不拦合并。
+#
+# 未配置 DEEPSEEK_API_KEY 或来自 fork 的 PR 时跳过，并在 run 页面写明原因。
+
+on:
+  pull_request:
+    # 刻意不挂 synchronize：每次 push 都刷评论是噪音，而且那时判据往往还没跑完。
+    types: [opened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: 'PR 编号'
+        required: true
+        type: string
+
+permissions:
+  issues: write
+  pull-requests: write
+  contents: read
+
+concurrency:
+  group: pr-acceptance-${{ github.event.pull_request.number || github.event.inputs.pr }}
+  cancel-in-progress: true
+
+jobs:
+  acceptance:
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (!github.event.pull_request.draft &&
+       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR","CONTRIBUTOR"]'), github.event.pull_request.author_association))
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Check configuration and fork
+        id: precheck
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          IS_DISPATCH: ${{ github.event_name == 'workflow_dispatch' }}
+          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          skip=false
+          if [ -z "$DEEPSEEK_API_KEY" ]; then
+            skip=true
+            echo "::notice::未配置 DEEPSEEK_API_KEY，跳过验收对账。"
+          fi
+          if [ "$IS_DISPATCH" != "true" ] && [ "$PR_HEAD_REPO" != "$REPO" ]; then
+            skip=true
+            echo "::notice::来自 fork 的 PR 拿不到本仓库的 secret，跳过验收对账。"
+          fi
+          echo "skip=$skip" >>"$GITHUB_OUTPUT"
+          if [ "$skip" = "true" ]; then
+            {
+              echo "### PR acceptance 已跳过"
+              echo
+              echo "原因见上方注解。PR 本身没有被改动。"
+            } >>"$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Generate acceptance context
+        id: ctx
+        if: steps.precheck.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number || github.event.inputs.pr }}
+        run: |
+          set -euo pipefail
+          ./scripts/workflow/pr-acceptance-context.sh --pr "$PR" --out "$GITHUB_WORKSPACE/.pr-acceptance"
+
+      - name: Gate on head and criteria
+        id: gate
+        if: steps.precheck.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number || github.event.inputs.pr }}
+        run: |
+          set -euo pipefail
+          head=$(awk -F'\t' '$1=="head"{print $2}' .pr-acceptance/meta.tsv | cut -c1-7)
+          [ -n "$head" ] || { echo "::error::读不到 head sha"; exit 1; }
+          echo "head=$head" >>"$GITHUB_OUTPUT"
+
+          report() { # $1=标题 $2=一句结论
+            {
+              echo "### 验收对账：$1"
+              echo
+              echo "- head：\`$head\`"
+              echo "- 结论：$2"
+            } >>"$GITHUB_STEP_SUMMARY"
+            echo "::notice::$2"
+          }
+
+          if grep -q '^⚠️ 无法判定' .pr-acceptance/facts.md; then
+            echo "skip=true" >>"$GITHUB_OUTPUT"
+            report "没有可对账的判据，不发评论" \
+              "PR 正文没写 \`Closes #N\`，或关联 issue 没有「验收」段；本次不评论。"
+            exit 0
+          fi
+
+          old=$(gh api "repos/{owner}/{repo}/issues/$PR/comments" --paginate \
+                  -q '.[] | select(.body | contains("caelestia-acceptance: head=")) | .id' | tail -1 || true)
+          echo "comment_id=$old" >>"$GITHUB_OUTPUT"
+          if [ -n "$old" ]; then
+            oldhead=$(gh api "repos/{owner}/{repo}/issues/comments/$old" -q .body \
+                        | sed -n 's/.*caelestia-acceptance: head=\([0-9a-f]\{7\}\).*/\1/p' | head -1)
+            if [ "$oldhead" = "$head" ]; then
+              echo "skip=true" >>"$GITHUB_OUTPUT"
+              report "head 没变，不发评论" "上一次评论已经覆盖 head $head，跳过。"
+            else
+              echo "skip=false" >>"$GITHUB_OUTPUT"
+              report "发出评论" "上一次评论是 $oldhead，本次 head 是 $head，更新那一条。"
+            fi
+          else
+            echo "skip=false" >>"$GITHUB_OUTPUT"
+            report "发出评论" "这条 PR 上还没有本检查的评论，新建一条（head $head）。"
+          fi
+
+      - name: Reconcile acceptance
+        id: ai
+        if: steps.precheck.outputs.skip != 'true' && steps.gate.outputs.skip != 'true'
+        uses: appleboy/LLM-action@v1.4.0
+        with:
+          base_url: 'https://api.deepseek.com'
+          api_key: ${{ secrets.DEEPSEEK_API_KEY }}
+          model: 'deepseek-flash'
+          max_tokens: '65536'
+          system_prompt: 'file:///github/workspace/docs/work/ai-review-rubric.md'
+          input_prompt: 'file:///github/workspace/.pr-acceptance/context.md'
+
+      - name: Publish or update comment
+        if: steps.precheck.outputs.skip != 'true' && steps.gate.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number || github.event.inputs.pr }}
+          COMMENT_ID: ${{ steps.gate.outputs.comment_id }}
+          HEAD: ${{ steps.gate.outputs.head }}
+          SEMANTIC: ${{ steps.ai.outputs.response }}
+        run: |
+          set -euo pipefail
+          {
+            cat .pr-acceptance/facts.md
+            echo
+            if [ -n "$SEMANTIC" ]; then
+              printf '%s\n' "$SEMANTIC"
+            else
+              echo "⚠️ 逐条复核本次没有输出，上面只有脚本算出的机械信号（不是判决）。"
+            fi
+            echo
+            printf '<!-- caelestia-acceptance: head=%s -->\n' "$HEAD"
+          } >.pr-acceptance/comment.md
+
+          jq -n --rawfile body .pr-acceptance/comment.md '{body: $body}' >.pr-acceptance/comment.json
+          if [ -n "$COMMENT_ID" ]; then
+            gh api -X PATCH "repos/{owner}/{repo}/issues/comments/$COMMENT_ID" --input .pr-acceptance/comment.json >/dev/null
+            echo "已就地更新评论 $COMMENT_ID"
+          else
+            gh api -X POST "repos/{owner}/{repo}/issues/$PR/comments" --input .pr-acceptance/comment.json >/dev/null
+            echo "已新建评论"
+          fi
+
+          [ -n "$SEMANTIC" ] || exit 1

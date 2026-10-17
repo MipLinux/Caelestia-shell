@@ -1,0 +1,143 @@
+name: Issue review（受理前质检）
+
+# 判据唯一源：docs/work/ai-review-rubric.md
+# 上下文脚本：scripts/workflow/ai-review-context.sh
+#
+# 脚本算确定性事实（所有权 / 硬撞 / 软邻近 / 仓库树），模型只做脚本做不到的四件事：
+# 判据质量、查重、引用有效性、把撞车讲清楚。
+#
+# 未配置 DEEPSEEK_API_KEY 时整个检查跳过，并在 run 页面写明原因。
+
+on:
+  issues:
+    types: [opened, edited]
+  workflow_dispatch:
+    inputs:
+      issue:
+        description: 'issue 编号'
+        required: true
+        type: string
+
+permissions:
+  issues: write
+  contents: read
+
+concurrency:
+  group: issue-review-${{ github.event.issue.number || github.event.inputs.issue }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    # 仓库公开：只对与本仓库有关联的人跑，避免陌生人消耗 token。
+    # CONTRIBUTOR 保留：组织 owner 在事件负载里也可能显示为 CONTRIBUTOR。
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      contains(fromJSON('["OWNER","MEMBER","COLLABORATOR","CONTRIBUTOR"]'), github.event.issue.author_association)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Check model configuration
+        id: precheck
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -n "$DEEPSEEK_API_KEY" ]; then
+            echo "enabled=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >>"$GITHUB_OUTPUT"
+            {
+              echo "### Issue review 已跳过"
+              echo
+              echo "未配置 \`DEEPSEEK_API_KEY\`，本次只跳过语义检查；issue 本身没有被改动。"
+            } >>"$GITHUB_STEP_SUMMARY"
+            echo "::notice::未配置 DEEPSEEK_API_KEY，跳过 issue review。"
+          fi
+
+      - name: Generate review context
+        if: steps.precheck.outputs.enabled == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE: ${{ github.event.issue.number || github.event.inputs.issue }}
+        run: |
+          set -euo pipefail
+          ./scripts/workflow/ai-review-context.sh --issue "$ISSUE" --out "$GITHUB_WORKSPACE/.ai-review"
+
+      - name: Skip unchanged body
+        id: gate
+        if: steps.precheck.outputs.enabled == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE: ${{ github.event.issue.number || github.event.inputs.issue }}
+        run: |
+          set -euo pipefail
+          sha=$(sed -n 's/.*· 正文 \([0-9a-f]\{8\}\)）.*/\1/p' .ai-review/facts.md | head -1)
+          [ -n "$sha" ] || { echo "::error::facts.md 里读不到正文 sha"; exit 1; }
+          echo "sha=$sha" >>"$GITHUB_OUTPUT"
+
+          old=$(gh api "repos/{owner}/{repo}/issues/$ISSUE/comments" --paginate \
+                  -q '.[] | select(.body | contains("caelestia-issue-review: body=")) | .id' | tail -1 || true)
+          echo "comment_id=$old" >>"$GITHUB_OUTPUT"
+
+          if [ -n "$old" ]; then
+            oldsha=$(gh api "repos/{owner}/{repo}/issues/comments/$old" -q .body \
+                       | sed -n 's/.*caelestia-issue-review: body=\([0-9a-f]\{8\}\).*/\1/p' | head -1)
+            if [ "$oldsha" = "$sha" ]; then
+              echo "skip=true" >>"$GITHUB_OUTPUT"
+              echo "正文没变（$sha），跳过。"
+            else
+              echo "skip=false" >>"$GITHUB_OUTPUT"
+            fi
+          else
+            echo "skip=false" >>"$GITHUB_OUTPUT"
+          fi
+
+      - name: Semantic review
+        id: ai
+        if: steps.precheck.outputs.enabled == 'true' && steps.gate.outputs.skip != 'true'
+        uses: appleboy/LLM-action@v1.4.0
+        with:
+          base_url: 'https://api.deepseek.com'
+          api_key: ${{ secrets.DEEPSEEK_API_KEY }}
+          model: 'deepseek-flash'
+          max_tokens: '65536'
+          # 这是 Docker action：容器内工作区挂载点是 /github/workspace，不是 runner 的 $GITHUB_WORKSPACE。
+          system_prompt: 'file:///github/workspace/docs/work/ai-review-rubric.md'
+          input_prompt: 'file:///github/workspace/.ai-review/context.md'
+
+      - name: Publish or update comment
+        if: steps.precheck.outputs.enabled == 'true' && steps.gate.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ISSUE: ${{ github.event.issue.number || github.event.inputs.issue }}
+          COMMENT_ID: ${{ steps.gate.outputs.comment_id }}
+          SHA: ${{ steps.gate.outputs.sha }}
+          SEMANTIC: ${{ steps.ai.outputs.response }}
+        run: |
+          set -euo pipefail
+          {
+            cat .ai-review/facts.md
+            echo
+            if [ -n "$SEMANTIC" ]; then
+              printf '%s\n' "$SEMANTIC"
+            else
+              echo "⚠️ 语义判断本次没有输出，上面只有脚本算出的确定性事实。"
+            fi
+            echo
+            printf '<!-- caelestia-issue-review: body=%s -->\n' "$SHA"
+          } >.ai-review/comment.md
+
+          jq -n --rawfile body .ai-review/comment.md '{body: $body}' >.ai-review/comment.json
+          if [ -n "$COMMENT_ID" ]; then
+            gh api -X PATCH "repos/{owner}/{repo}/issues/comments/$COMMENT_ID" --input .ai-review/comment.json >/dev/null
+            echo "已就地更新评论 $COMMENT_ID"
+          else
+            gh api -X POST "repos/{owner}/{repo}/issues/$ISSUE/comments" --input .ai-review/comment.json >/dev/null
+            echo "已新建评论"
+          fi
+
+          [ -n "$SEMANTIC" ] || exit 1

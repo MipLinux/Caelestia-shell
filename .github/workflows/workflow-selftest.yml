@@ -1,0 +1,49 @@
+name: Workflow self-test
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  self-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v7
+
+      - name: Shell syntax
+        run: |
+          set -euo pipefail
+          bash -n scripts/workflow/*.sh
+          bash -n scripts/workflow/tests/*.sh
+
+      - name: Workflow script tests
+        run: |
+          set -euo pipefail
+          ./scripts/workflow/tests/check-work-issue.test.sh
+          ./scripts/workflow/tests/ai-review-context.test.sh
+          ./scripts/workflow/tests/pr-acceptance-context.test.sh
+          ./scripts/workflow/tests/pr-review-context.test.sh
+          ./scripts/workflow/tests/render-pr-review.test.sh
+
+      - name: Python syntax
+        run: |
+          set -euo pipefail
+          python3 -m py_compile scripts/workflow/render-pr-review.py
+
+      - name: YAML syntax
+        run: |
+          set -euo pipefail
+          ruby -ryaml -e '
+            ARGV.each do |path|
+              YAML.load_file(path)
+              puts "ok #{path}"
+            end
+          ' .github/workflows/*.yml .github/ISSUE_TEMPLATE/*.yml

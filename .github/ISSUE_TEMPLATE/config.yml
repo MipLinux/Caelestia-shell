@@ -1,1 +1,8 @@
 blank_issues_enabled: false
+contact_links:
+  - name: 工作流程与工作 issue 规范
+    url: https://github.com/MipLinux/Caelestia-shell/blob/main/docs/work/README.md
+    about: 开工前先读这里：工作 issue 字段、验收口径、分支与 PR 流程。
+  - name: 上游 Caelestia 文档
+    url: https://github.com/caelestia-dots/shell
+    about: 上游的安装、配置与常见问题；本 fork 的差异见 NOTICE.md。

@@ -21,4 +21,4 @@ jobs:
       cancel-in-progress: true
     with:
       prefixes: >-
-        [["crash","CRASH"],["bug","BUG"],["enhancement","FEATURE"]]
+        [["crash","CRASH"],["bug","BUG"],["enhancement","FEATURE"],["task","工作"]]
